@@ -1,0 +1,15 @@
+/build/
+/dist/
+/target/
+/out/
+
+*.o
+*.obj
+*.a
+*.lib
+
+*.so
+*.dylib
+*.dll
+
+*.dSYM/
