@@ -1,172 +1,113 @@
-# tinydb — C++ (C-style) checkpoint
+# TinyDB checkpoint
 
-## Ground rules
-- No user-defined classes, no exceptions, no RTTI, no iostreams.
-- C-style APIs + plain `struct`s; compile as C++ for nicer types.
-- Use only: `constexpr`, `static_assert`, `enum class`, `std::array`, `std::string_view`, `std::span`.
-- All disk integers are **little-endian**. All I/O is page-aligned and page-sized.
+The C++ to C migration is complete. TinyDB is a personal learning project in
+plain C11. The user writes new features; Codex explains concepts and reviews
+attempts. See `AGENTS.md` for the permanent learning rules.
 
----
+## Build and run
 
-## Constants & format (v1)
-- `PAGE_SIZE = 4096`
-- `MAGIC = "TDB1"` (4 bytes)
-- `VERSION = 1`
-- **Page 0** is the **header** page.
-- `page_count` **includes** the header (min value: 1 ⇒ header only).
+```sh
+make
+make run
+make clean
+```
 
-### Header (page 0) layout (4096 bytes total)
-| Field        | Type    | Size       | Notes                           |
-|--------------|---------|------------|---------------------------------|
-| magic        | char[4] | 4          | `"TDB1"`                        |
-| version      | u32     | 4          | `1`                             |
-| page_size    | u32     | 4          | must equal `4096`               |
-| page_count   | u32     | 4          | total pages incl. header        |
-| reserved     | bytes   | 4096 - 16  | zero-filled (future use)        |
+`make run` creates the parent directory if necessary and runs the demo against
+`data/tiny.db`. Each successful run inserts one more five-byte `hello` record
+into page 1. It stops with an error when that page is full.
 
-**Invariants on open**
-- `magic == "TDB1"`
-- `version == 1`
-- `page_size == 4096`
-- `page_count >= 1`
+For experiments, choose a fresh temporary directory so existing data stays safe:
 
----
+```sh
+scratch_dir=$(mktemp -d)
+make run DB_PATH="$scratch_dir/tiny.db"
+./tinydb "$scratch_dir/tiny.db"
+```
 
-## Modules (incremental)
+The executable also defaults to `data/tiny.db` when no path is supplied. Direct
+execution expects the parent directory to exist. `make clean` removes only the
+executable, never database files.
 
-### 1) io (file handle + raw I/O)
-**Goal:** thin wrapper around OS calls, still C-style.
+## Actual file layout, version 1
 
-Functions:
-- `Status io_open_rw(const char* path, /*out*/ int* fd, bool create)`
-- `void   io_close(int fd)`
-- `Status io_pread_all(int fd, void* buf, size_t n, uint64_t off)`
-- `Status io_pwrite_all(int fd, const void* buf, size_t n, uint64_t off)`
-- `Status io_truncate(int fd, uint64_t size)`
-- `Status io_fsync(int fd)` *(later; stub ok now)*
+The source is `main.c`. Pages are 4096 bytes, numbered from zero. A page's ID is
+its position in the file, not a field stored inside it. Its byte offset is
+`page_number * PAGE_SIZE`.
 
----
+Page 0 is a `Header`:
 
-### 2) pager (page math + header cache)
-**Goal:** page-numbered access, append pages, maintain header cache.
+| Byte offset | Field | Size |
+| --- | --- | --- |
+| 0 | `magic` (`TDB1`) | 4 |
+| 4 | `version` (`uint16_t`, value 1) | 2 |
+| 6 | `page_size` (`uint16_t`, value 4096) | 2 |
+| 8 | `page_count` (`uint32_t`, includes page 0) | 4 |
+| 12 | `reserved` (zero-filled on creation) | 4084 |
 
-Types:
-- `struct TDB { int fd; Header header; /*maybe path*/ };`
+There is no separate `flags` field in the current implementation. The earlier
+checkpoint's 32-bit version and page-size fields were inaccurate. The migration
+preserves the actual C++ source layout, including all reserved bytes.
 
-Functions:
-- `Status tdb_open(const char* path, /*out*/ TDB* db)`  
-  - Create if missing: write fresh header (count=1).  
-  - If exists: read+validate header.
-- `void   tdb_close(TDB* db)`
-- `Status tdb_read_page(TDB* db, uint32_t page_n, void* out_4096)`
-- `Status tdb_write_page(TDB* db, uint32_t page_n, const void* in_4096)`
-- `Status tdb_append_page(TDB* db, /*out*/ uint32_t* new_page_n)`  
-  - Zero-fill new page, write it, update `header.page_count`, persist header.
-- `Status tdb_sync(TDB* db)` *(optional for now)*
+Integers are written in native byte order, as before. This host produces
+little-endian files. Cross-endian portability is not implemented. C11 size and
+offset assertions guard against struct layout changes; packed structs are not
+needed on this platform.
 
-**Bounds/Checks**
-- `page_n < header.page_count` for read/write.
-- Offset: `off = uint64_t(page_n) * PAGE_SIZE`.
-- New pages are zeroed; header rewritten after successful page write.
+Pages 1 onward are `DataPage` values:
 
----
+- `payload_end`: a 16-bit offset of the next free payload byte in `body`.
+- `slot_count`: a 16-bit count of directory entries.
+- `body`: 4092 bytes shared by payloads, free space, and the directory.
+- `Slot`: a 16-bit `off` (record offset relative to `body`) and a 16-bit `len`
+  (record length in bytes).
 
-### 3) freelist (simple page allocator)
-**Goal:** reuse freed pages instead of always appending.
+```text
+DataPage: [payload_end:2][slot_count:2][body:4092]
+body:    [payloads --->][free space][slot 0][slot 1]...[slot N-1]
+                                  ^ dir_start
+```
 
-Plan (v0): a single linked list of free pages; head stored in header reserved area (we’ll later pick exact offsets).
+`dir_start = BODY_SIZE - slot_count * SLOT_SIZE`.
+`free_space = dir_start - payload_end` for a valid page. Insertion needs the
+record length plus four bytes for its slot. Slots are indexed from `dir_start`;
+adding one moves existing slots four bytes toward lower offsets so their indexes
+remain stable.
 
-Functions:
-- `Status tdb_alloc_page(TDB* db, /*out*/ uint32_t* page_n)`
-- `Status tdb_free_page(TDB* db, uint32_t page_n)`
+## Implemented and verified
 
----
+- Header creation, validation, synchronization, and reopening.
+- Page-sized `read_page` and `write_page` with caller-owned buffers.
+- Zero-filled append and `ensure_page`, including intermediate pages and the
+  persisted page count.
+- Slot entry access with `slot_get` and `slot_set`.
+- The existing demo insertion into page 1; repeated insertion preserves slots.
+- Rejection of full pages and impossible page-header bounds before insertion.
+- New-file creation only after a missing-file error, using C11 exclusive
+  creation to avoid truncating an existing file.
 
-### 4) btree (node format & operations)
-Start with one table (key→value store).  
+Migration checks used temporary files and
+AddressSanitizer/UndefinedBehaviorSanitizer:
+creation/reopening, raw page round trips, zero-filled intermediate pages, header
+persistence, slot access, 454 inserts up to a full page, and rejection without
+modification for full, malformed, truncated, and read-only files. The first C
+insertion matched a C++-generated file byte for byte. C++ fixtures and a copy of
+the existing database reopened successfully. All Makefile targets and the
+default/custom paths were exercised. The repository database's SHA-256 stayed
+unchanged.
 
-**v0 simplification:** fixed-size keys (e.g., u64) and fixed-size values (e.g., u64) to avoid varlen complexity.
+## Remaining work
 
-Node page header (conceptual): node type, count, left/right sibling (optional), array of slots.
+The existing repository database already has an empty first slot
+(`off=0, len=0`) from the old insertion bug. Its payload bytes are present, but
+the migration does not guess missing metadata or repair that file. The corrected
+insertion preserves old directory entries as stored and prevents new occurrences
+of that bug.
 
-Functions (sequence we’ll build):
-- parse node from page buffer
-- search in node (binary search)
-- insert into node (no split)
-- split node, update links
-- root split handling
+Record lookup by slot index, deletion/tombstones, compaction, free-page
+management, indexes/B-trees, transactions, and crash recovery remain
+unimplemented. There is no general insert API or interactive query interface.
+`fflush` does not provide crash recovery. Full-file consistency validation and
+cross-endian encoding are also unfinished.
 
----
-
-### 5) transactions (later)
-Choose **shadow paging** first (simpler mental model):
-- Write modified pages to new locations.
-- Atomically update a root pointer (stored in header) at commit.
-- Crash either leaves old root or new root (no partial).  
-
-WAL can be a later evolution.
-
----
-
-## Status & errors (shared)
-- Codes: `ok, io_error, invalid, corruption, nomem`.
-- A `Status` is tiny: `{ code, message(optional) }`.
-- Hot paths should avoid formatting messages; tests/tools can check `.code`.
-
----
-
-## Tests (per lesson)
-
-### Lesson 1 — pager
-- **Create & validate header**
-  - New file → `page_count == 1`, magic/version/size ok.
-- **Append + roundtrip**
-  - Append page → write known bytes → read back → compare.
-- **Reopen**
-  - Close → open → header persists; read written page.
-
-### Lesson 2 — freelist
-- **Alloc/free/alloc**
-  - Append 3 pages; free one; alloc again returns freed page id.
-- **Bounds**
-  - Free invalid page id → `invalid` or `corruption`.
-
-### Lesson 3/4 — btree
-- **Insert/search (no split)**
-  - Insert few pairs; search finds all.
-- **Split**
-  - Force split; both sides contain appropriate keys; parent/root updated.
-
----
-
-## Non-goals (for now)
-- Variable-length records/overflow pages.
-- Concurrency (single-writer, single-process assumed).
-- Checksums/compression/encryption.
-- Fancy cache; we’ll read/write directly until correctness is proven.
-
----
-
-## Build & style
-- C++20 (or 17), compile with:
-  - `-Wall -Wextra -Wconversion -Werror`
-  - `-fno-exceptions -fno-rtti`
-- Prefer `_t`-free names; use lowercase with underscores for C vibe.
-- Keep headers minimal; no templates authored by us.
-
----
-
-## Open questions
-- Do we store a **freelist head** in header’s reserved area (and at which byte offset)?  
-  - Suggestion: reserve first 16 bytes in `reserved` for future “superblock” fields:
-    - `u32 freelist_head_page` (0 == none)
-    - `u32 root_page` (for btree/shadow paging)
-    - rest still zero.
-- Fixed key/value sizes for v0? (recommend `u64 key`, `u64 value` to start)
-- Endianness helpers: add tiny encode/decode or rely on native + assert LE for now?
-
----
-
-## Next step
-Start **Lesson 1**: define `Header` fields & `DB` struct (names only), then implement `tdb_open` behavior step-by-step (create vs open + validation), followed by `tdb_append_page`, `tdb_read_page`, `tdb_write_page`. Tiny pieces, explained as we go.
-
+The next learning topic is reading a record through a slot index. Discuss it
+first, then let the user attempt one small step.

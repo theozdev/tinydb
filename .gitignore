@@ -1,4 +1,5 @@
 /build/
+/tinydb
 /dist/
 /target/
 /out/
